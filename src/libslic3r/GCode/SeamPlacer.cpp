@@ -941,44 +941,125 @@ size_t pick_nearest_seam_point_index(const std::vector<SeamCandidate> &perimeter
   return seam_index;
 }
 
-// Picks seam point that is supported by the previous layer's wall, minimizing travel from last_pos.
-// Falls back to the least-unsupported point if no fully supported candidate exists.
+// Exact distance from point P to line segment [A, B].
+static float point_to_segment_dist_sq(const Vec2f &p, const Vec2f &a, const Vec2f &b) {
+  Vec2f ab = b - a;
+  float ab_sq = ab.squaredNorm();
+  if (ab_sq < 1e-12f) return (p - a).squaredNorm(); // degenerate segment
+  float t = std::clamp((p - a).dot(ab) / ab_sq, 0.0f, 1.0f);
+  Vec2f closest = a + t * ab;
+  return (p - closest).squaredNorm();
+}
+
+// Computes the minimum distance from point P to any wall segment on the previous layer.
+// Uses line-segment distance (not vertex distance) for sub-point accuracy.
+static float min_wall_segment_dist(const Vec2f &p,
+                                   const std::vector<SeamPlacerImpl::SeamCandidate> &prev_points) {
+  float min_dist_sq = std::numeric_limits<float>::max();
+
+  // Iterate over all perimeters on the previous layer
+  for (size_t peri_start = 0; peri_start < prev_points.size();
+       peri_start = prev_points[peri_start].perimeter.end_index) {
+    size_t peri_end = prev_points[peri_start].perimeter.end_index;
+    for (size_t i = peri_start; i < peri_end; ++i) {
+      size_t next = (i + 1 < peri_end) ? i + 1 : peri_start; // wrap around (closed polygon)
+      Vec2f a = prev_points[i].position.head<2>();
+      Vec2f b = prev_points[next].position.head<2>();
+      float d_sq = point_to_segment_dist_sq(p, a, b);
+      min_dist_sq = std::min(min_dist_sq, d_sq);
+    }
+  }
+  return std::sqrt(min_dist_sq);
+}
+
+// V4: Transition-based seam placement.
+// Instead of measuring distances, finds the points where 'overhang' transitions
+// from positive (gap/unsupported) to zero (supported). These transition points
+// are exactly where the current wall ENTERS the supported zone — the beginning
+// of each overlap with the previous wall. Among transition points, picks nearest
+// to last_pos for alignment.
+// Falls back to nearest-supported-to-last_pos if no transitions found (non-shift layers).
 size_t pick_supported_seam_point_index(const std::vector<SeamCandidate> &perimeter_points, size_t start_index,
-                                       const Vec2f &preferred_location) {
+                                       const Vec2f &preferred_location,
+                                       const PrintObjectSeamData::LayerSeams *prev_layer = nullptr) {
   size_t end_index = perimeter_points[start_index].perimeter.end_index;
+  size_t peri_size = end_index - start_index;
 
-  size_t best_supported      = start_index;
-  float  best_supported_dist = std::numeric_limits<float>::max();
-  bool   found_supported     = false;
-
-  size_t least_unsupported      = start_index;
-  float  min_unsupported_dist   = std::numeric_limits<float>::max();
+  // Strategy 1: Find overhang transitions (gap → supported)
+  // These are the exact points where the wall enters the previous wall's area
+  size_t best_transition = start_index;
+  float  best_transition_travel = std::numeric_limits<float>::max();
+  bool   found_transition = false;
 
   for (size_t idx = start_index; idx < end_index; ++idx) {
-    const auto &point = perimeter_points[idx];
+    if (perimeter_points[idx].type == EnforcedBlockedSeamPoint::Blocked) continue;
 
-    // Skip blocked points
-    if (point.type == EnforcedBlockedSeamPoint::Blocked)
-      continue;
+    // Previous point (wrapping around for closed polygon)
+    size_t prev_idx = (idx > start_index) ? idx - 1 : end_index - 1;
 
-    float travel = (point.position.head<2>() - preferred_location).squaredNorm();
+    bool prev_unsupported = perimeter_points[prev_idx].overhang > 0.0f;
+    bool curr_supported   = perimeter_points[idx].overhang <= 0.0f;
 
-    if (point.unsupported_dist <= 0.0f) {
-      // Point is supported by previous layer
-      if (!found_supported || travel < best_supported_dist) {
-        best_supported      = idx;
-        best_supported_dist = travel;
-        found_supported     = true;
+    if (prev_unsupported && curr_supported) {
+      // Transition found — check if the supported zone is substantial (not just a tip)
+      // Count consecutive supported points after this transition
+      size_t run_length = 0;
+      for (size_t k = idx; k < end_index; ++k) {
+        if (perimeter_points[k].overhang <= 0.0f)
+          run_length++;
+        else
+          break;
       }
-    }
 
-    if (point.unsupported_dist < min_unsupported_dist) {
-      min_unsupported_dist = point.unsupported_dist;
-      least_unsupported    = idx;
+      // Require at least 2% of perimeter to be supported (filters out narrow tips)
+      size_t min_run = std::max(size_t(10), peri_size / 50);
+      if (run_length < min_run) continue;  // skip tip transitions
+
+      // Valid transition — prefer LONGEST supported run (real wall overlap > tip overlap)
+      // Travel as secondary tiebreaker among similar run lengths
+      float travel = (perimeter_points[idx].position.head<2>() - preferred_location).norm();
+      // Score: longer run = better (negative), travel breaks ties
+      float score = -float(run_length) * 1000.0f + travel;
+
+      if (!found_transition || score < best_transition_travel) {
+        best_transition_travel = score;
+        best_transition = idx;
+        found_transition = true;
+      }
     }
   }
 
-  return found_supported ? best_supported : least_unsupported;
+  if (found_transition) return best_transition;
+
+  // Strategy 2: No transitions found (fully supported layer — non-shift)
+  // Pick supported point nearest to last_pos
+  size_t best_supported = start_index;
+  float  best_supported_travel = std::numeric_limits<float>::max();
+  bool   found_supported = false;
+
+  for (size_t idx = start_index; idx < end_index; ++idx) {
+    if (perimeter_points[idx].type == EnforcedBlockedSeamPoint::Blocked) continue;
+    if (perimeter_points[idx].overhang > 0.0f) continue;
+
+    float travel = (perimeter_points[idx].position.head<2>() - preferred_location).squaredNorm();
+    if (travel < best_supported_travel) {
+      best_supported_travel = travel;
+      best_supported = idx;
+      found_supported = true;
+    }
+  }
+
+  if (found_supported) return best_supported;
+
+  // Strategy 3: No supported points at all — pick nearest to last_pos
+  size_t best = start_index;
+  float  best_dist = std::numeric_limits<float>::max();
+  for (size_t idx = start_index; idx < end_index; ++idx) {
+    if (perimeter_points[idx].type == EnforcedBlockedSeamPoint::Blocked) continue;
+    float travel = (perimeter_points[idx].position.head<2>() - preferred_location).squaredNorm();
+    if (travel < best_dist) { best_dist = travel; best = idx; }
+  }
+  return best;
 }
 
 // picks random seam point uniformly, respecting enforcers blockers and overhang avoidance.
@@ -1464,6 +1545,76 @@ void SeamPlacer::align_seam_points(const PrintObject *po, const SeamPlacerImpl::
 
 }
 
+// V3: Precomputes seam positions using direct perimeter-to-perimeter distance.
+// For each point on the current perimeter, measures the XY distance to the nearest
+// perimeter point on the PREVIOUS layer (via KDTree). This directly answers
+// "is this point over the previous wall?" — no lslices, no overhang heuristics.
+// Works correctly for single-wall models where lslices-based metrics fail.
+void SeamPlacer::precompute_supported_seams(const PrintObject *po) {
+  using namespace SeamPlacerImpl;
+  std::vector<PrintObjectSeamData::LayerSeams> &layers = m_seam_per_object[po].layers;
+
+  if (layers.empty()) return;
+
+  Vec2f previous_seam_xy = Vec2f::Zero();
+
+  for (size_t li = 0; li < layers.size(); ++li) {
+    auto &layer_seams = layers[li];
+    if (layer_seams.points.empty()) continue;
+
+    // Process each perimeter in this layer
+    for (size_t cur = 0; cur < layer_seams.points.size();
+         cur = layer_seams.points[cur].perimeter.end_index) {
+      Perimeter &peri = layer_seams.points[cur].perimeter;
+      size_t start = peri.start_index;
+      size_t end   = peri.end_index;
+
+      size_t seam = start;
+
+      if (li == 0) {
+        // First layer: pick nearest to origin (arbitrary, build plate supports all)
+        seam = start;
+      } else {
+        // Use KDTree of the previous layer to find wall distance for each point
+        const auto &prev_layer = layers[li - 1];
+        if (prev_layer.points_tree && !prev_layer.points.empty()) {
+          float prev_z = prev_layer.points[0].position.z();
+
+          float best_score = std::numeric_limits<float>::max();
+
+          for (size_t idx = start; idx < end; ++idx) {
+            const auto &point = layer_seams.points[idx];
+            if (point.type == EnforcedBlockedSeamPoint::Blocked)
+              continue;
+
+            // Query KDTree: find nearest point on previous layer's perimeter
+            Vec3f query = Vec3f(point.position.x(), point.position.y(), prev_z);
+            size_t nearest_prev = find_closest_point(*prev_layer.points_tree, query);
+            float wall_dist = (point.position.head<2>()
+                               - prev_layer.points[nearest_prev].position.head<2>()).norm();
+
+            // Travel distance to previous seam (for alignment/tiebreaking)
+            float travel_dist = (point.position.head<2>() - previous_seam_xy).norm();
+
+            // Score: wall distance dominates, travel as weak tiebreaker
+            float score = wall_dist + 0.01f * travel_dist;
+
+            if (score < best_score) {
+              best_score = score;
+              seam = idx;
+            }
+          }
+        }
+      }
+
+      peri.seam_index = seam;
+      peri.final_seam_position = layer_seams.points[seam].position;
+      peri.finalized = true;
+      previous_seam_xy = layer_seams.points[seam].position.head<2>();
+    }
+  }
+}
+
 void SeamPlacer::init(const Print &print, std::function<void(void)> throw_if_canceled_func) {
   using namespace SeamPlacerImpl;
   m_seam_per_object.clear();
@@ -1502,7 +1653,7 @@ void SeamPlacer::init(const Print &print, std::function<void(void)> throw_if_can
     BOOST_LOG_TRIVIAL(debug)
         << "SeamPlacer: calculate_overhangs and layer embdedding: end";
     throw_if_canceled_func();
-    if (configured_seam_preference != spNearest && configured_seam_preference != spSupported) { // For spNearest/spSupported, the seam is picked in the place_seam method with actual nozzle position information
+    if (configured_seam_preference != spNearest && configured_seam_preference != spSupported) {
       BOOST_LOG_TRIVIAL(debug)
           << "SeamPlacer: pick_seam_point : start";
       //pick seam point
@@ -1595,9 +1746,12 @@ void SeamPlacer::place_seam(const Layer *layer, ExtrusionLoop &loop,
     if (seam_pos == spNearest)
       seam_index = pick_nearest_seam_point_index(layer_perimeters.points, perimeter.start_index,
                                                   unscaled<float>(last_pos));
-    else if (seam_pos == spSupported)
+    else if (seam_pos == spSupported) {
+      const auto &all_layers = m_seam_per_object.find(po)->second.layers;
+      const PrintObjectSeamData::LayerSeams *prev = (layer_index > 0) ? &all_layers[layer_index - 1] : nullptr;
       seam_index = pick_supported_seam_point_index(layer_perimeters.points, perimeter.start_index,
-                                                    unscaled<float>(last_pos));
+                                                    unscaled<float>(last_pos), prev);
+    }
     else
       seam_index = perimeter.seam_index;
     seam_position = layer_perimeters.points[seam_index].position;

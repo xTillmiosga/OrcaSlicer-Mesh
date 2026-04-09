@@ -150,6 +150,7 @@ private:
                                        const SeamPlacerImpl::GlobalModelInfo &global_model_info);
   void calculate_overhangs_and_layer_embedding(const PrintObject *po);
   void align_seam_points(const PrintObject *po, const SeamPlacerImpl::SeamComparator &comparator);
+  void precompute_supported_seams(const PrintObject *po);
   std::vector<std::pair<size_t, size_t>> find_seam_string(const PrintObject *po,
                                                           std::pair<size_t, size_t> start_seam,
                                                           const SeamPlacerImpl::SeamComparator &comparator) const;

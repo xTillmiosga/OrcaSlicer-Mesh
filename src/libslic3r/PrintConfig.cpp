@@ -5052,6 +5052,19 @@ void PrintConfigDef::init_fff_params()
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionEnum<SeamPosition>(spAligned));
 
+    def = this->add("supported_seam_threshold_percent", coInt);
+    def->label = L("Supported seam threshold");
+    def->category = L("Quality");
+    def->tooltip = L("Controls how sensitive the shift-layer detection is for the 'Supported' seam mode. "
+                     "A layer is classified as a shift layer when the percentage of supported perimeter points "
+                     "falls below this threshold. Higher values = more layers treated as shift layers. "
+                     "Lower values = fewer shift detections. Only effective when seam position is set to 'Supported'.");
+    def->sidetext = L("%");
+    def->min = 10;
+    def->max = 95;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(80));
+
     def = this->add("staggered_inner_seams", coBool);
     def->label = L("Staggered inner seams");
     def->category = L("Quality");
