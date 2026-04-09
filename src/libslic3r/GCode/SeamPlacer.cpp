@@ -941,6 +941,46 @@ size_t pick_nearest_seam_point_index(const std::vector<SeamCandidate> &perimeter
   return seam_index;
 }
 
+// Picks seam point that is supported by the previous layer's wall, minimizing travel from last_pos.
+// Falls back to the least-unsupported point if no fully supported candidate exists.
+size_t pick_supported_seam_point_index(const std::vector<SeamCandidate> &perimeter_points, size_t start_index,
+                                       const Vec2f &preferred_location) {
+  size_t end_index = perimeter_points[start_index].perimeter.end_index;
+
+  size_t best_supported      = start_index;
+  float  best_supported_dist = std::numeric_limits<float>::max();
+  bool   found_supported     = false;
+
+  size_t least_unsupported      = start_index;
+  float  min_unsupported_dist   = std::numeric_limits<float>::max();
+
+  for (size_t idx = start_index; idx < end_index; ++idx) {
+    const auto &point = perimeter_points[idx];
+
+    // Skip blocked points
+    if (point.type == EnforcedBlockedSeamPoint::Blocked)
+      continue;
+
+    float travel = (point.position.head<2>() - preferred_location).squaredNorm();
+
+    if (point.unsupported_dist <= 0.0f) {
+      // Point is supported by previous layer
+      if (!found_supported || travel < best_supported_dist) {
+        best_supported      = idx;
+        best_supported_dist = travel;
+        found_supported     = true;
+      }
+    }
+
+    if (point.unsupported_dist < min_unsupported_dist) {
+      min_unsupported_dist = point.unsupported_dist;
+      least_unsupported    = idx;
+    }
+  }
+
+  return found_supported ? best_supported : least_unsupported;
+}
+
 // picks random seam point uniformly, respecting enforcers blockers and overhang avoidance.
 void pick_random_seam_point(const std::vector<SeamCandidate> &perimeter_points, size_t start_index) {
   SeamComparator comparator { spRandom };
@@ -1462,7 +1502,7 @@ void SeamPlacer::init(const Print &print, std::function<void(void)> throw_if_can
     BOOST_LOG_TRIVIAL(debug)
         << "SeamPlacer: calculate_overhangs and layer embdedding: end";
     throw_if_canceled_func();
-    if (configured_seam_preference != spNearest) { // For spNearest, the seam is picked in the place_seam method with actual nozzle position information
+    if (configured_seam_preference != spNearest && configured_seam_preference != spSupported) { // For spNearest/spSupported, the seam is picked in the place_seam method with actual nozzle position information
       BOOST_LOG_TRIVIAL(debug)
           << "SeamPlacer: pick_seam_point : start";
       //pick seam point
@@ -1551,11 +1591,15 @@ void SeamPlacer::place_seam(const Layer *layer, ExtrusionLoop &loop,
     seam_position = perimeter.final_seam_position;
     seam_index = perimeter.seam_index;
   } else {
-    seam_index =
-        po->config().seam_position == spNearest ?
-                                                pick_nearest_seam_point_index(layer_perimeters.points, perimeter.start_index,
-                                                                              unscaled<float>(last_pos)) :
-                                                perimeter.seam_index;
+    const auto seam_pos = po->config().seam_position.value;
+    if (seam_pos == spNearest)
+      seam_index = pick_nearest_seam_point_index(layer_perimeters.points, perimeter.start_index,
+                                                  unscaled<float>(last_pos));
+    else if (seam_pos == spSupported)
+      seam_index = pick_supported_seam_point_index(layer_perimeters.points, perimeter.start_index,
+                                                    unscaled<float>(last_pos));
+    else
+      seam_index = perimeter.seam_index;
     seam_position = layer_perimeters.points[seam_index].position;
   }
 
