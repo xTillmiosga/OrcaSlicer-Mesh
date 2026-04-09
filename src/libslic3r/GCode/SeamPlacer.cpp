@@ -1545,74 +1545,132 @@ void SeamPlacer::align_seam_points(const PrintObject *po, const SeamPlacerImpl::
 
 }
 
-// V3: Precomputes seam positions using direct perimeter-to-perimeter distance.
-// For each point on the current perimeter, measures the XY distance to the nearest
-// perimeter point on the PREVIOUS layer (via KDTree). This directly answers
-// "is this point over the previous wall?" — no lslices, no overhang heuristics.
-// Works correctly for single-wall models where lslices-based metrics fail.
+// Precomputes seam positions using perimeter-to-perimeter distance + transition detection.
+// For each perimeter point, measures XY distance to the nearest point on the REFERENCE
+// layer's perimeter (via KDTree). Then finds transitions from "far from wall" to "on wall"
+// — the exact points where the current wall enters the previous wall's area.
+// Combines V3's direct wall distance with V4's transition detection logic.
+// Works correctly for single-wall hollow models where lslices-based metrics fail.
+//
+// With mesh_group_layers > 0: sub-layers within a group use the last layer of the
+// PREVIOUS group as reference (not the immediately preceding layer, which has the
+// same horizontal position and would show all points as "on wall").
+// Precomputes seam positions for shift layers using KDTree perimeter-to-perimeter
+// distance with angular consistency. For each point on the current perimeter,
+// measures XY distance to nearest point on the reference perimeter (one group back).
+// Points with minimal distance are "crossing candidates." Among candidates, picks
+// the one whose angle (relative to the ring centroid) best matches the previous seam.
 void SeamPlacer::precompute_supported_seams(const PrintObject *po) {
   using namespace SeamPlacerImpl;
-  std::vector<PrintObjectSeamData::LayerSeams> &layers = m_seam_per_object[po].layers;
 
-  if (layers.empty()) return;
+  int mesh_group = po->config().mesh_group_layers.value;
 
-  Vec2f previous_seam_xy = Vec2f::Zero();
+  FILE* dbg = fopen("/tmp/mesh_seam_debug.log", "w");
+  if (dbg) fprintf(dbg, "precompute_supported_seams mesh_group=%d\n", mesh_group);
+
+  if (mesh_group <= 0) { if (dbg) { fprintf(dbg, "disabled\n"); fclose(dbg); } return; }
+
+  auto &layers = m_seam_per_object[po].layers;
+  if (dbg) fprintf(dbg, "total layers: %zu\n", layers.size());
+  if (layers.empty()) { if (dbg) fclose(dbg); return; }
+
+  float previous_seam_angle = 0.0f;
 
   for (size_t li = 0; li < layers.size(); ++li) {
+    if ((int)li % mesh_group != 0) continue;
+    if (li < 1) continue;
+
     auto &layer_seams = layers[li];
     if (layer_seams.points.empty()) continue;
 
-    // Process each perimeter in this layer
-    for (size_t cur = 0; cur < layer_seams.points.size();
-         cur = layer_seams.points[cur].perimeter.end_index) {
-      Perimeter &peri = layer_seams.points[cur].perimeter;
-      size_t start = peri.start_index;
-      size_t end   = peri.end_index;
-
-      size_t seam = start;
-
-      if (li == 0) {
-        // First layer: pick nearest to origin (arbitrary, build plate supports all)
-        seam = start;
-      } else {
-        // Use KDTree of the previous layer to find wall distance for each point
-        const auto &prev_layer = layers[li - 1];
-        if (prev_layer.points_tree && !prev_layer.points.empty()) {
-          float prev_z = prev_layer.points[0].position.z();
-
-          float best_score = std::numeric_limits<float>::max();
-
-          for (size_t idx = start; idx < end; ++idx) {
-            const auto &point = layer_seams.points[idx];
-            if (point.type == EnforcedBlockedSeamPoint::Blocked)
-              continue;
-
-            // Query KDTree: find nearest point on previous layer's perimeter
-            Vec3f query = Vec3f(point.position.x(), point.position.y(), prev_z);
-            size_t nearest_prev = find_closest_point(*prev_layer.points_tree, query);
-            float wall_dist = (point.position.head<2>()
-                               - prev_layer.points[nearest_prev].position.head<2>()).norm();
-
-            // Travel distance to previous seam (for alignment/tiebreaking)
-            float travel_dist = (point.position.head<2>() - previous_seam_xy).norm();
-
-            // Score: wall distance dominates, travel as weak tiebreaker
-            float score = wall_dist + 0.01f * travel_dist;
-
-            if (score < best_score) {
-              best_score = score;
-              seam = idx;
-            }
-          }
+    // Reference = li-1 (last layer of previous group, at group boundary).
+    // Fallback: li-2, li-3 (still in previous group, same horizontal position).
+    size_t ref_li = li - 1;
+    const PrintObjectSeamData::LayerSeams *ref_ptr = nullptr;
+    for (int offset : {0, -1, -2}) {
+      int try_li = (int)ref_li + offset;
+      if (try_li >= 0 && try_li < (int)layers.size() &&
+          layers[try_li].points_tree && !layers[try_li].points.empty()) {
+        // Check this layer has a real perimeter (not just tiny fragments)
+        size_t ps = layers[try_li].points[0].perimeter.start_index;
+        size_t pe = layers[try_li].points[0].perimeter.end_index;
+        if (pe - ps >= 100) {
+          ref_ptr = &layers[try_li];
+          if (offset != 0 && dbg) fprintf(dbg, "layer %zu: ref %zu+%d\n", li, ref_li, offset);
+          break;
         }
       }
+    }
+    if (!ref_ptr) {
+      if (dbg) fprintf(dbg, "layer %zu: no valid ref found\n", li);
+      continue;
+    }
+
+    float ref_z = ref_ptr->points[0].position.z();
+
+    for (size_t cur = 0; cur < layer_seams.points.size();
+         cur = layer_seams.points[cur].perimeter.end_index) {
+      auto &peri = layer_seams.points[cur].perimeter;
+      size_t start = peri.start_index;
+      size_t end   = peri.end_index;
+      size_t peri_size = end - start;
+      if (peri_size < 100) continue;
+
+      // Step 1: Compute centroid of current perimeter
+      Vec2f centroid = Vec2f::Zero();
+      for (size_t idx = start; idx < end; ++idx)
+        centroid += layer_seams.points[idx].position.head<2>();
+      centroid /= float(peri_size);
+
+      // Step 2: Compute wall_dist for each point via KDTree
+      float min_wd = std::numeric_limits<float>::max();
+      std::vector<float> wall_dists(peri_size);
+      for (size_t i = 0; i < peri_size; ++i) {
+        const auto &pt = layer_seams.points[start + i];
+        Vec3f query(pt.position.x(), pt.position.y(), ref_z);
+        size_t nearest = find_closest_point(*ref_ptr->points_tree, query);
+        wall_dists[i] = (pt.position.head<2>() - ref_ptr->points[nearest].position.head<2>()).norm();
+        min_wd = std::min(min_wd, wall_dists[i]);
+      }
+
+      // Step 3: Collect crossing candidates (within 0.1mm of min wall_dist)
+      float threshold = min_wd + 0.1f;
+      size_t seam = start;
+      float best_angle_diff = std::numeric_limits<float>::max();
+
+      for (size_t i = 0; i < peri_size; ++i) {
+        if (wall_dists[i] > threshold) continue;
+        if (layer_seams.points[start + i].type == EnforcedBlockedSeamPoint::Blocked) continue;
+
+        // Compute angle of this point relative to centroid
+        Vec2f dir = layer_seams.points[start + i].position.head<2>() - centroid;
+        float angle = std::atan2(dir.y(), dir.x());
+
+        // Pick candidate with angle closest to previous seam angle
+        float diff = std::abs(angle - previous_seam_angle);
+        if (diff > float(M_PI)) diff = 2.0f * float(M_PI) - diff;
+
+        if (diff < best_angle_diff) {
+          best_angle_diff = diff;
+          seam = start + i;
+        }
+      }
+
+      // Track angle for next layer
+      Vec2f seam_dir = layer_seams.points[seam].position.head<2>() - centroid;
+      previous_seam_angle = std::atan2(seam_dir.y(), seam_dir.x());
+
+      if (dbg) fprintf(dbg, "layer %zu: peri=%zu min_wd=%.3f candidates=%d angle=%.1f\n",
+        li, peri_size, min_wd,
+        (int)std::count_if(wall_dists.begin(), wall_dists.end(), [threshold](float d){ return d <= threshold; }),
+        previous_seam_angle * 180.0f / float(M_PI));
 
       peri.seam_index = seam;
       peri.final_seam_position = layer_seams.points[seam].position;
       peri.finalized = true;
-      previous_seam_xy = layer_seams.points[seam].position.head<2>();
     }
   }
+  if (dbg) { fprintf(dbg, "done\n"); fclose(dbg); }
 }
 
 void SeamPlacer::init(const Print &print, std::function<void(void)> throw_if_canceled_func) {
@@ -1653,6 +1711,12 @@ void SeamPlacer::init(const Print &print, std::function<void(void)> throw_if_can
     BOOST_LOG_TRIVIAL(debug)
         << "SeamPlacer: calculate_overhangs and layer embdedding: end";
     throw_if_canceled_func();
+    if (configured_seam_preference == spSupported) {
+      BOOST_LOG_TRIVIAL(debug) << "SeamPlacer: precompute_supported_seams : start";
+      precompute_supported_seams(po);
+      BOOST_LOG_TRIVIAL(debug) << "SeamPlacer: precompute_supported_seams : end";
+      throw_if_canceled_func();
+    }
     if (configured_seam_preference != spNearest && configured_seam_preference != spSupported) {
       BOOST_LOG_TRIVIAL(debug)
           << "SeamPlacer: pick_seam_point : start";
@@ -1741,8 +1805,10 @@ void SeamPlacer::place_seam(const Layer *layer, ExtrusionLoop &loop,
       perimeter.finalized) {
     seam_position = perimeter.final_seam_position;
     seam_index = perimeter.seam_index;
+    // MESH_SEAM debug: finalized path taken
   } else {
     const auto seam_pos = po->config().seam_position.value;
+    // MESH_SEAM debug: NOT finalized path taken
     if (seam_pos == spNearest)
       seam_index = pick_nearest_seam_point_index(layer_perimeters.points, perimeter.start_index,
                                                   unscaled<float>(last_pos));

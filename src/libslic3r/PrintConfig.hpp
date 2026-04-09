@@ -911,6 +911,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInt,                 raft_layers))
     ((ConfigOptionEnum<SeamPosition>,  seam_position))
     ((ConfigOptionInt,                 supported_seam_threshold_percent))
+    // Mesh group continuous flow: layers per group (0 = disabled)
+    ((ConfigOptionInt,                 mesh_group_layers))
     ((ConfigOptionBool,                staggered_inner_seams))
     ((ConfigOptionFloat,               slice_closing_radius))
     ((ConfigOptionEnum<SlicingMode>,   slicing_mode))

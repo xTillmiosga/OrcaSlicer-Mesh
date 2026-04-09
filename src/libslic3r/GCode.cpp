@@ -4448,7 +4448,11 @@ LayerResult GCode::process_layer(
     m_layer = &layer;
     m_object_layer_over_raft = false;
 
-    if (!m_config.time_lapse_gcode.value.empty() && !is_BBL_Printer()) {
+    // Mesh sub-layers: suppress all timelapse insertion
+    if (m_mesh_sublayer)
+        need_insert_timelapse_gcode_for_traditional = false;
+
+    if (!m_config.time_lapse_gcode.value.empty() && !is_BBL_Printer() && !m_mesh_sublayer) {
         DynamicConfig config;
         config.set_key_value("layer_num", new ConfigOptionInt(m_layer_index));
         config.set_key_value("layer_z", new ConfigOptionFloat(print_z));
@@ -4958,7 +4962,7 @@ LayerResult GCode::process_layer(
         return timelapse_gcode;
     };
 
-    if (!need_insert_timelapse_gcode_for_traditional  && is_BBL_Printer()) { // Equivalent to the timelapse gcode placed in layer_change_gcode
+    if (!need_insert_timelapse_gcode_for_traditional && is_BBL_Printer() && !m_mesh_sublayer) { // Equivalent to the timelapse gcode placed in layer_change_gcode
         if (FILAMENT_CONFIG(retract_when_changing_layer)) {
             gcode += this->retract(false, false, auto_lift_type, true);
         }
@@ -5539,7 +5543,20 @@ std::string GCode::change_layer(coordf_t print_z)
         gcode += m_writer.update_progress(++ m_layer_index, m_layer_count);
     //BBS
     coordf_t z = print_z + m_config.z_offset.value;  // in unscaled coordinates
-    if (FILAMENT_CONFIG(retract_when_changing_layer) && m_writer.will_move_z(z)) {
+
+    // --- Mesh group sub-layer detection ---
+    int mesh_group_size = m_config.mesh_group_layers.value;
+    m_mesh_sublayer = false;
+    if (mesh_group_size > 0 && m_layer_index > 0) {
+        m_mesh_sublayer = (m_layer_index % mesh_group_size != 0);
+    }
+
+    if (m_mesh_sublayer) {
+        // Sub-layer: simple Z-step, no retract / Z-hop
+        std::ostringstream comment;
+        comment << "mesh sublayer Z-step (layer " << m_layer_index << ")";
+        gcode += m_writer.travel_to_z(z, comment.str());
+    } else if (FILAMENT_CONFIG(retract_when_changing_layer) && m_writer.will_move_z(z)) {
         LiftType lift_type = this->to_lift_type(ZHopType(FILAMENT_CONFIG(z_hop_types)));
         //BBS: force to use SpiralLift when change layer if lift type is auto
         gcode += this->retract(false, false, ZHopType(FILAMENT_CONFIG(z_hop_types)) == ZHopType::zhtAuto ? LiftType::SpiralLift : lift_type);
@@ -5554,7 +5571,9 @@ std::string GCode::change_layer(coordf_t print_z)
         gcode += m_writer.travel_to_z(z, comment.str());
     }
 
-    m_need_change_layer_lift_z = true;
+    // Sub-layers already have Z set; normal layers defer Z to first travel
+    if (!m_mesh_sublayer)
+        m_need_change_layer_lift_z = true;
 
     m_nominal_z = z;
     m_writer.get_position().z() = z;
@@ -5614,8 +5633,13 @@ std::string GCode::extrude_loop(ExtrusionLoop loop, std::string description, dou
     Point last_pos = start_point ? *start_point : this->last_pos();
     float seam_overhang = std::numeric_limits<float>::lowest();
     if (!m_config.spiral_mode && description == "perimeter") {
-        assert(m_layer != nullptr);
-        m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang);
+        if (m_mesh_sublayer) {
+            // Sub-layer: start where nozzle is (continuous flow, no travel)
+            loop.split_at(this->last_pos(), false);
+        } else {
+            assert(m_layer != nullptr);
+            m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang);
+        }
     } else
         loop.split_at(last_pos, false);
 

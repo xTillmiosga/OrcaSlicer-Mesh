@@ -5065,6 +5065,19 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(80));
 
+    def = this->add("mesh_group_layers", coInt);
+    def->label = L("Mesh group layers");
+    def->category = L("Quality");
+    def->tooltip = L("Number of layers per mesh group for continuous flow printing. "
+                     "Within a group, retracts, Z-hops, and timelapse blocks between sub-layers "
+                     "are replaced with simple Z-steps. The extrusion path of each sub-layer starts "
+                     "where the previous layer ended. The first group is auto-detected from the first "
+                     "shift layer (double Z-delta). Set to 0 to disable.");
+    def->min = 0;
+    def->max = 20;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(3));
+
     def = this->add("staggered_inner_seams", coBool);
     def->label = L("Staggered inner seams");
     def->category = L("Quality");

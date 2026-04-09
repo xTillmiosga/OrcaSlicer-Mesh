@@ -628,6 +628,8 @@ private:
     unsigned int m_toolchange_count;
     coordf_t m_nominal_z;
     bool m_need_change_layer_lift_z = false;
+    // Mesh group continuous flow
+    bool     m_mesh_sublayer = false;           // current layer is a sub-layer within a group
     int m_start_gcode_filament = -1;
     std::string m_filament_instances_code;
 
