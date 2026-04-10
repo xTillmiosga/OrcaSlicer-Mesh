@@ -5502,11 +5502,14 @@ void GCode::set_extruders(const std::vector<unsigned int> &extruder_ids)
 
     // enable wipe path generation if any extruder has wipe enabled
     m_wipe.enable = false;
-    for (auto id : extruder_ids)
-        if (m_config.wipe.get_at(id)) {
-            m_wipe.enable = true;
-            break;
-        }
+    // Mesh groups: disable wipe entirely (prevents "hook" artifact at layer ends)
+    if (m_config.mesh_group_layers.value <= 0) {
+        for (auto id : extruder_ids)
+            if (m_config.wipe.get_at(id)) {
+                m_wipe.enable = true;
+                break;
+            }
+    }
 }
 
 void GCode::set_origin(const Vec2d &pointf)
@@ -5557,6 +5560,9 @@ std::string GCode::change_layer(coordf_t print_z)
         comment << "mesh sublayer Z-step (layer " << m_layer_index << ")";
         gcode += m_writer.travel_to_z(z, comment.str());
     } else if (FILAMENT_CONFIG(retract_when_changing_layer) && m_writer.will_move_z(z)) {
+        // Mesh groups: disable wipe before retract (prevents "hook" artifact at layer end)
+        if (m_config.mesh_group_layers.value > 0)
+            m_wipe.reset_path();
         LiftType lift_type = this->to_lift_type(ZHopType(FILAMENT_CONFIG(z_hop_types)));
         //BBS: force to use SpiralLift when change layer if lift type is auto
         gcode += this->retract(false, false, ZHopType(FILAMENT_CONFIG(z_hop_types)) == ZHopType::zhtAuto ? LiftType::SpiralLift : lift_type);
@@ -5663,7 +5669,9 @@ std::string GCode::extrude_loop(ExtrusionLoop loop, std::string description, dou
     // if polyline was shorter than the clipping distance we'd get a null polyline, so
     // we discard it in that case
     const double seam_gap = scale_(m_config.seam_gap.get_abs_value(nozzle_diameter));
-    const double clip_length = m_enable_loop_clipping && !enable_seam_slope ? seam_gap : 0;
+    // Mesh groups: no seam gap for shift layers (loop must close fully for mesh pattern)
+    const bool mesh_no_gap = (m_config.mesh_group_layers.value > 0 && !m_mesh_sublayer);
+    const double clip_length = m_enable_loop_clipping && !enable_seam_slope && !mesh_no_gap ? seam_gap : 0;
 
     // get paths
     ExtrusionPaths paths;
@@ -7388,7 +7396,9 @@ std::string GCode::retract(bool toolchange, bool is_last_retraction, LiftType li
         return gcode;
 
     // wipe (if it's enabled for this extruder and we have a stored wipe path and no-zero wipe distance)
-    if (FILAMENT_CONFIG(wipe) && m_wipe.has_path() && scale_(FILAMENT_CONFIG(wipe_distance)) > SCALED_EPSILON) {
+    // Mesh groups: skip wipe entirely to avoid "hook" artifact at layer ends
+    if (FILAMENT_CONFIG(wipe) && m_wipe.has_path() && scale_(FILAMENT_CONFIG(wipe_distance)) > SCALED_EPSILON
+        && m_config.mesh_group_layers.value <= 0) {
         Wipe::RetractionValues wipeRetractions = m_wipe.calculateWipeRetractionLengths(*this, toolchange);
         gcode += toolchange ? m_writer.retract_for_toolchange(true,wipeRetractions.retractLengthBeforeWipe) : m_writer.retract(true, wipeRetractions.retractLengthBeforeWipe);
         gcode += m_wipe.wipe(*this,wipeRetractions.retractLengthDuringWipe, toolchange, is_last_retraction);
