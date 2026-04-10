@@ -1656,9 +1656,13 @@ void SeamPlacer::precompute_supported_seams(const PrintObject *po) {
         }
       }
 
-      // Track angle for next layer
+      // Damped angle update: mostly keep previous angle, slight pull toward new
       Vec2f seam_dir = layer_seams.points[seam].position.head<2>() - centroid;
-      previous_seam_angle = std::atan2(seam_dir.y(), seam_dir.x());
+      float new_angle = std::atan2(seam_dir.y(), seam_dir.x());
+      float angle_diff = new_angle - previous_seam_angle;
+      if (angle_diff > float(M_PI)) angle_diff -= 2.0f * float(M_PI);
+      if (angle_diff < -float(M_PI)) angle_diff += 2.0f * float(M_PI);
+      previous_seam_angle += 0.15f * angle_diff;
 
       if (dbg) fprintf(dbg, "layer %zu: peri=%zu min_wd=%.3f candidates=%d angle=%.1f\n",
         li, peri_size, min_wd,
